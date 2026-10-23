@@ -25,8 +25,8 @@ import (
 	"strconv"
 	"strings"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apiserver/pkg/storage"
@@ -74,22 +74,24 @@ func NewEmptyModel(prefix string, newFunc, newListFunc func() runtime.Object, ve
 
 // Model is a state machine that mimics kubernetes storage behavior. Used for Linarizability testing of storage.
 type Model struct {
-	Items           map[string]runtime.Object
-	ResourceVersion uint64
-	Prefix          string
-	Versioner       storage.Versioner
-	NewFunc         func() runtime.Object
-	NewListFunc     func() runtime.Object
+	Items                  map[string]runtime.Object
+	ResourceVersion        uint64
+	CompactResourceVersion uint64
+	Prefix                 string
+	Versioner              storage.Versioner
+	NewFunc                func() runtime.Object
+	NewListFunc            func() runtime.Object
 }
 
 func (s *Model) Clone() *Model {
 	clone := &Model{
-		Items:           make(map[string]runtime.Object, len(s.Items)),
-		ResourceVersion: s.ResourceVersion,
-		Prefix:          s.Prefix,
-		NewFunc:         s.NewFunc,
-		NewListFunc:     s.NewListFunc,
-		Versioner:       s.Versioner,
+		Items:                  make(map[string]runtime.Object, len(s.Items)),
+		ResourceVersion:        s.ResourceVersion,
+		CompactResourceVersion: s.CompactResourceVersion,
+		Prefix:                 s.Prefix,
+		NewFunc:                s.NewFunc,
+		NewListFunc:            s.NewListFunc,
+		Versioner:              s.Versioner,
 	}
 	for k, v := range s.Items {
 		if v != nil {
@@ -100,30 +102,32 @@ func (s *Model) Clone() *Model {
 }
 
 func (s *Model) Equal(other *Model) bool {
-	return s.ResourceVersion == other.ResourceVersion && s.Prefix == other.Prefix && reflect.DeepEqual(s.Items, other.Items)
+	return s.ResourceVersion == other.ResourceVersion && s.CompactResourceVersion == other.CompactResourceVersion && s.Prefix == other.Prefix && reflect.DeepEqual(s.Items, other.Items)
 }
 
 // Step applies an operation to the sequential state machine. change is the
 // write the operation made, or nil if the operation didn't write.
 func (s *Model) Step(input Request, output Response) (ok bool, next *Model, change *Change) {
-	if input.Op == OpGet && input.Get.Options.ResourceVersion != "" {
-		if err := s.checkGet(input.Key, input.Get.Options); err != nil {
-			return reflect.DeepEqual(Response{Err: err}, output), s, nil
+	if output.Object == nil && apierrors.IsTooManyRequests(output.Err) {
+		switch input.Op {
+		case OpGet, OpList:
+			return true, s, nil
+		default:
+			panic("Errors on writes not supported by the model")
 		}
-		return s.validateGetRV(input.Key, input.Get.Options, output), s, nil
-	}
-	if input.Op == OpList && input.List.Options.ResourceVersion != "" {
-		if err := s.checkList(input.Key, input.List.Options); err != nil {
-			return reflect.DeepEqual(Response{Err: err}, output), s, nil
-		}
-		// Model only validates consistent reads, for stale reads we just validate RV and contents are validated later during replay.
-		return s.validateListRV(input.List.Options, output), s, nil
 	}
 	expected, next, change := s.execute(input)
-	if !reflect.DeepEqual(expected, output) {
-		return false, s, nil
+	switch input.Op {
+	case OpGet:
+		return s.validateGet(input.Get.Options, expected, output), s, nil
+	case OpList:
+		return s.validateList(input.Key, input.List.Options, expected, output), s, nil
+	default:
+		if !reflect.DeepEqual(expected, output) {
+			return false, s, nil
+		}
+		return true, next, change
 	}
-	return true, next, change
 }
 
 // execute returns the response storage gives for input served from this
@@ -136,19 +140,9 @@ func (s *Model) execute(input Request) (Response, *Model, *Change) {
 		return resp, next, change
 	case OpDelete:
 		next := s.Clone()
-		resp, change := next.delete(context.Background(), input.Key, input.Delete.Preconditions, nil)
+		resp, change := next.delete(context.Background(), input.Key, input.Delete.Preconditions, input.Delete.ValidateDeletion)
 		return resp, next, change
 	case OpGet:
-		if err := s.checkGet(input.Key, input.Get.Options); err != nil {
-			return Response{Err: err}, s, nil
-		}
-		if input.Get.Options.ResourceVersion != "" {
-			// checkGet already rejected unparsable RVs.
-			rv, _ := s.Versioner.ParseResourceVersion(input.Get.Options.ResourceVersion)
-			if rv > s.ResourceVersion {
-				return Response{Err: storage.NewTooLargeResourceVersionError(rv, s.ResourceVersion, 0)}, s, nil
-			}
-		}
 		return s.get(input.Key, input.Get.Options), s, nil
 	case OpList:
 		return s.list(input.Key, input.List.Options), s, nil
@@ -156,124 +150,139 @@ func (s *Model) execute(input Request) (Response, *Model, *Change) {
 		next := s.Clone()
 		resp, change := next.update(context.Background(), input.Key, input.Update.IgnoreNotFound, input.Update.Preconditions, input.Update.UpdateFunc, input.Update.CachedExistingObject)
 		return resp, next, change
+	case OpCompact:
+		next := s.Clone()
+		return next.compact(input.Compact.ResourceVersion), next, nil
 	default:
 		panic(fmt.Sprintf("unknown operation %q", input.Op))
 	}
 }
 
-func (s *Model) checkGet(key string, opts storage.GetOptions) error {
-	if err := checkKey(key, false); err != nil {
-		return err
-	}
-	if _, err := s.Versioner.ParseResourceVersion(opts.ResourceVersion); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *Model) validateGetRV(key string, opts storage.GetOptions, output Response) bool {
-	reqRV, err := s.Versioner.ParseResourceVersion(opts.ResourceVersion)
-	if err != nil {
-		return false
-	}
-	if output.Err != nil {
-		if storage.IsTooLargeResourceVersion(output.Err) {
-			return output.Object == nil && reqRV > s.ResourceVersion
+func (s *Model) validateGet(opts storage.GetOptions, expected, output Response) bool {
+	if expected.Err != nil {
+		switch {
+		case storage.IsTooLargeResourceVersion(expected.Err):
+			return output.Object == nil && storage.IsTooLargeResourceVersion(output.Err)
+		case storage.IsNotFound(expected.Err):
+		default:
+			return reflect.DeepEqual(expected, output)
 		}
-		if storageErr, ok := output.Err.(*storage.StorageError); ok && storageErr.Code == storage.ErrCodeKeyNotFound {
-			errRV := uint64(storageErr.ResourceVersion)
-			// Cacher returns NotFound errors without the underlying etcd prefix.
-			return !opts.IgnoreNotFound && storageErr.ResourceVersion > 0 && errRV >= reqRV && errRV <= s.ResourceVersion &&
-				(reflect.DeepEqual(output, Response{Err: storage.NewKeyNotFoundError(s.Prefix+key, storageErr.ResourceVersion)}) ||
-					reflect.DeepEqual(output, Response{Err: storage.NewKeyNotFoundError(key, storageErr.ResourceVersion)}))
+	}
+	if output.Err != nil && output.Object != nil {
+		return false
+	}
+	reqRV, _ := s.Versioner.ParseResourceVersion(opts.ResourceVersion)
+	switch GetReadConsistency(opts) {
+	case ConsistencyConsistent:
+		return reflect.DeepEqual(expected, output)
+	case ConsistencyNotOlderThan:
+		if _, retry := apierrors.SuggestsClientDelay(output.Err); retry && reqRV > 0 && storage.IsTooLargeResourceVersion(output.Err) {
+			return true
 		}
-		return false
-	}
-	if output.Object == nil || reqRV > s.ResourceVersion {
-		return false
-	}
-	respRV, err := s.Versioner.ObjectResourceVersion(output.Object)
-	if err != nil {
-		return false
-	}
-	if respRV == 0 {
-		return opts.IgnoreNotFound && reflect.DeepEqual(output.Object, s.NewFunc())
-	}
-	return respRV <= s.ResourceVersion
-}
-
-// checkList returns the error storage returns for an invalid list and panics
-// on lists the model doesn't support.
-func (s *Model) checkList(key string, opts storage.ListOptions) error {
-	if err := checkKey(key, opts.Recursive); err != nil {
-		return err
-	}
-	if _, _, err := storage.ValidateListOptions("", s.Versioner, opts); err != nil {
-		return err
-	}
-	if opts.Predicate.Label == nil || opts.Predicate.Field == nil {
-		// etcd3 and the cacher call methods on both selectors.
-		panic("nil label or field selector is not supported, use storage.Everything to match everything")
-	}
-	if opts.Predicate.Limit != 0 || opts.Predicate.Continue != "" {
-		panic("pagination (limit, continue) is not supported")
-	}
-	if !opts.Predicate.Empty() && opts.Predicate.GetAttrs == nil {
-		panic("selectors without GetAttrs are not supported")
-	}
-	if opts.RecordTimestamps {
-		panic("recordTimestamps is not supported, it wraps objects in storage-internal types")
-	}
-	if !opts.Predicate.Empty() {
-		panic("label and field selectors are not supported, the model doesn't filter lists")
-	}
-	return nil
-}
-
-func (s *Model) validateListRV(opts storage.ListOptions, output Response) bool {
-	if opts.ResourceVersion == "" {
-		return true
-	}
-	reqRV, err := s.Versioner.ParseResourceVersion(opts.ResourceVersion)
-	if err != nil {
-		return false
-	}
-	if output.Err != nil {
-		// RV from future must return error
-		if storage.IsTooLargeResourceVersion(output.Err) {
-			return output.Object == nil && reqRV > s.ResourceVersion
+		// Model only validates consistent reads, for stale reads we just validate RV and contents are validated later during replay.
+		if storage.IsNotFound(output.Err) {
+			outputErr := output.Err.(*storage.StorageError)
+			respRV := uint64(outputErr.ResourceVersion)
+			return respRV > 0 && respRV >= reqRV && respRV <= s.ResourceVersion
 		}
-		return false
-	}
-	if output.Object == nil {
-		return false
-	}
-	accessor, err := meta.ListAccessor(output.Object)
-	if err != nil {
-		return false
-	}
-	respRV, err := s.Versioner.ParseResourceVersion(accessor.GetResourceVersion())
-	if err != nil || respRV == 0 {
-		return false
-	}
-	// RV from future that didn't return error is invalid.
-	if respRV > s.ResourceVersion {
-		return false
-	}
-	switch opts.ResourceVersionMatch {
-	case metav1.ResourceVersionMatchExact:
-		return reqRV > 0 && respRV == reqRV
-	case metav1.ResourceVersionMatchNotOlderThan:
-		return respRV >= reqRV
-	case "":
-		// Legacy exact match
-		if opts.Recursive && opts.Predicate.Limit > 0 && reqRV > 0 {
-			return respRV == reqRV
+		if output.Err != nil || output.Object == nil {
+			return false
 		}
-		return respRV >= reqRV
+		respRV, err := s.Versioner.ObjectResourceVersion(output.Object)
+		return err == nil && respRV <= s.ResourceVersion
 	default:
 		return false
 	}
+}
+
+func (s *Model) validateList(key string, opts storage.ListOptions, expected, output Response) bool {
+	if expected.Err != nil {
+		switch {
+		case storage.IsTooLargeResourceVersion(expected.Err):
+			return output.Object == nil && storage.IsTooLargeResourceVersion(output.Err)
+		default:
+			return reflect.DeepEqual(expected, output)
+		}
+	}
+	consistency, reqRV, _, err := ListReadConsistency("", s.Versioner, opts)
+	if err != nil {
+		return false
+	}
+	if _, retry := apierrors.SuggestsClientDelay(output.Err); retry && reqRV > 0 && output.Object == nil && storage.IsTooLargeResourceVersion(output.Err) {
+		return true
+	}
+	switch consistency {
+	case ConsistencyConsistent:
+		return s.equalListResponse(key, opts, expected, output)
+	case ConsistencyExact:
+		// Model only validates consistent reads, for stale reads we just validate RV and contents are validated later during replay.
+		respRV, ok := s.listResponseRV(output)
+		return ok && respRV == reqRV
+	case ConsistencyNotOlderThan:
+		// Model only validates consistent reads, for stale reads we just validate RV and contents are validated later during replay.
+		respRV, ok := s.listResponseRV(output)
+		return ok && respRV >= max(reqRV, s.CompactResourceVersion) && respRV <= s.ResourceVersion
+	default:
+		return false
+	}
+}
+
+func (s *Model) equalListResponse(key string, opts storage.ListOptions, expected, output Response) bool {
+	if reflect.DeepEqual(expected, output) {
+		return true
+	}
+	if opts.Predicate.Limit <= 0 || expected.Err != nil || output.Err != nil || expected.Object == nil || output.Object == nil {
+		return false
+	}
+	expAccessor, err := meta.ListAccessor(expected.Object)
+	if err != nil || expAccessor.GetContinue() == "" {
+		return false
+	}
+	outAccessor, err := meta.ListAccessor(output.Object)
+	if err != nil {
+		return false
+	}
+	outContinue := outAccessor.GetContinue()
+	if !s.validCacherContinue(key, opts, expAccessor.GetContinue(), outContinue) {
+		return false
+	}
+	expectedWithOutContinue := expected.Object.DeepCopyObject()
+	accessor, err := meta.ListAccessor(expectedWithOutContinue)
+	if err != nil {
+		return false
+	}
+	accessor.SetContinue(outContinue)
+	return reflect.DeepEqual(expectedWithOutContinue, output.Object)
+}
+
+func (s *Model) validCacherContinue(key string, opts storage.ListOptions, expContinue, outContinue string) bool {
+	if outContinue == "" {
+		// When filtering with a limit and the number of matching items equals the limit,
+		// full-range scans (etcd3, cacher without index) return a continue token if
+		// non-matching items follow the last match, whereas index-backed cacher scans
+		// only the matching index bucket and returns an empty continue token.
+		if opts.Predicate.Empty() {
+			return false
+		}
+		items, err := s.listItems(key, opts)
+		return err == nil && int64(len(items)) == opts.Predicate.Limit
+	}
+	return false
+}
+
+func (s *Model) listResponseRV(output Response) (uint64, bool) {
+	if output.Err != nil || output.Object == nil {
+		return 0, false
+	}
+	accessor, err := meta.ListAccessor(output.Object)
+	if err != nil {
+		return 0, false
+	}
+	respRV, err := s.Versioner.ParseResourceVersion(accessor.GetResourceVersion())
+	if err != nil || respRV == 0 {
+		return 0, false
+	}
+	return respRV, true
 }
 
 func (s *Model) update(ctx context.Context, key string, ignoreNotFound bool, preconditions *storage.Preconditions, tryUpdate storage.UpdateFunc, cachedExistingObject runtime.Object) (Response, *Change) {
@@ -362,6 +371,16 @@ func (s *Model) create(key string, obj runtime.Object) (Response, *Change) {
 }
 
 func (s *Model) get(key string, opts storage.GetOptions) Response {
+	if err := checkKey(key, false); err != nil {
+		return Response{Err: err}
+	}
+	rv, err := s.Versioner.ParseResourceVersion(opts.ResourceVersion)
+	if err != nil {
+		return Response{Err: err}
+	}
+	if rv > s.ResourceVersion {
+		return Response{Err: storage.NewTooLargeResourceVersionError(rv, s.ResourceVersion, 0)}
+	}
 	stored, exists := s.Items[key]
 	if !exists {
 		if opts.IgnoreNotFound {
@@ -373,23 +392,106 @@ func (s *Model) get(key string, opts storage.GetOptions) Response {
 }
 
 func (s *Model) list(key string, opts storage.ListOptions) Response {
-	if err := s.checkList(key, opts); err != nil {
+	preparedKey, err := storage.PrepareKey("", key, opts.Recursive)
+	if err != nil {
 		return Response{Err: err}
 	}
+	consistency, rv, _, err := ListReadConsistency("", s.Versioner, opts)
+	if err != nil {
+		return Response{Err: err}
+	}
+	if opts.Predicate.Label == nil || opts.Predicate.Field == nil {
+		// etcd3 and the cacher call methods on both selectors.
+		panic("nil label or field selector is not supported, use storage.Everything to match everything")
+	}
+	if opts.Predicate.Limit < 0 || opts.Predicate.Continue != "" {
+		panic("negative limit or continue is not supported")
+	}
+	if opts.Predicate.Limit > 0 && opts.ResourceVersion == "0" {
+		panic("limit with resourceVersion 0 is not supported (#108003)")
+	}
+	if !opts.Predicate.Empty() && opts.Predicate.GetAttrs == nil {
+		panic("selectors without GetAttrs are not supported")
+	}
+	if opts.RecordTimestamps {
+		panic("recordTimestamps is not supported, it wraps objects in storage-internal types")
+	}
+	if rv > s.ResourceVersion {
+		return Response{Err: storage.NewTooLargeResourceVersionError(rv, s.ResourceVersion, 0)}
+	}
+	if consistency == ConsistencyExact && rv < s.CompactResourceVersion {
+		return Response{Err: apierrors.NewResourceExpired("The resourceVersion for the provided list is too old.")}
+	}
 	var items []runtime.Object
+	var lastKey string
+	var hasMore bool
+	var totalCount int64
+	limit := opts.Predicate.Limit
 	for _, k := range slices.Sorted(maps.Keys(s.Items)) {
-		if keyInScope(key, opts.Recursive, k) {
-			items = append(items, s.Items[k].DeepCopyObject())
+		if !keyInScope(key, opts.Recursive, k) {
+			continue
 		}
+		totalCount++
+		if limit > 0 && int64(len(items)) >= limit {
+			hasMore = true
+			continue
+		}
+		obj := s.Items[k]
+		matches, err := opts.Predicate.Matches(obj)
+		if err != nil {
+			return Response{Err: err}
+		}
+		if matches {
+			items = append(items, obj.DeepCopyObject())
+			lastKey = k
+		}
+	}
+	continueValue, remainingItemCount, err := storage.PrepareContinueToken(lastKey, preparedKey, int64(s.ResourceVersion), totalCount, hasMore, opts)
+	if err != nil {
+		return Response{Err: err}
 	}
 	list := s.NewListFunc()
 	if err := meta.SetList(list, items); err != nil {
 		return Response{Object: nil, Err: err}
 	}
-	if err := s.Versioner.UpdateList(list, s.ResourceVersion, "", nil); err != nil {
+	if err := s.Versioner.UpdateList(list, s.ResourceVersion, continueValue, remainingItemCount); err != nil {
 		return Response{Object: nil, Err: err}
 	}
 	return Response{Object: list, Err: nil}
+}
+
+func (s *Model) compact(rvStr string) Response {
+	rv, err := s.Versioner.ParseResourceVersion(rvStr)
+	if err != nil {
+		return Response{Err: err}
+	}
+	if rv == 0 {
+		return Response{}
+	}
+	if rv > s.ResourceVersion {
+		return Response{Err: storage.NewTooLargeResourceVersionError(rv, s.ResourceVersion, 0)}
+	}
+	s.ResourceVersion++
+	s.CompactResourceVersion = max(s.CompactResourceVersion, rv)
+	return Response{}
+}
+
+func (s *Model) listItems(key string, opts storage.ListOptions) ([]runtime.Object, error) {
+	var items []runtime.Object
+	for _, k := range slices.Sorted(maps.Keys(s.Items)) {
+		if !keyInScope(key, opts.Recursive, k) {
+			continue
+		}
+		obj := s.Items[k]
+		matches, err := opts.Predicate.Matches(obj)
+		if err != nil {
+			return nil, err
+		}
+		if matches {
+			items = append(items, obj.DeepCopyObject())
+		}
+	}
+	return items, nil
 }
 
 // keyInScope reports whether k is selected by a list or watch on key.
@@ -407,22 +509,16 @@ func checkKey(key string, recursive bool) error {
 }
 
 func (s *Model) initialEvents(request WatchRequest) ([]watch.Event, error) {
+	items, err := s.listItems(request.Key, request.Options)
+	if err != nil {
+		return nil, err
+	}
 	var events []watch.Event
-	for _, k := range slices.Sorted(maps.Keys(s.Items)) {
-		if !keyInScope(request.Key, request.Options.Recursive, k) {
-			continue
-		}
-		obj := s.Items[k]
-		matches, err := request.Options.Predicate.Matches(obj)
-		if err != nil {
-			return nil, err
-		}
-		if matches {
-			events = append(events, watch.Event{
-				Type:   watch.Added,
-				Object: obj.DeepCopyObject(),
-			})
-		}
+	for _, obj := range items {
+		events = append(events, watch.Event{
+			Type:   watch.Added,
+			Object: obj,
+		})
 	}
 	return events, nil
 }
@@ -439,7 +535,7 @@ func (s *Model) delete(ctx context.Context, key string, preconditions *storage.P
 		return Response{Object: nil, Err: err}, nil
 	}
 	if validateDeletion != nil && stored != nil {
-		if err := validateDeletion(ctx, stored); err != nil {
+		if err := validateDeletion(ctx, stored.DeepCopyObject()); err != nil {
 			return Response{Object: nil, Err: err}, nil
 		}
 	}
@@ -463,6 +559,9 @@ func (s *Model) Describe() string {
 		} else {
 			items = append(items, fmt.Sprintf("<p>%s: %s, RV:%s</p>", key, accessor.GetUID(), accessor.GetResourceVersion()))
 		}
+	}
+	if s.CompactResourceVersion > 0 {
+		return fmt.Sprintf("RV: %d, CompactRV: %d, Items: %s", s.ResourceVersion, s.CompactResourceVersion, strings.Join(items, ""))
 	}
 	return fmt.Sprintf("RV: %d, Items: %s", s.ResourceVersion, strings.Join(items, ""))
 }

@@ -53,6 +53,7 @@ import (
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/cri-streaming/pkg/streaming/portforward"
 	"k8s.io/cri-streaming/pkg/streaming/remotecommand"
+	"k8s.io/ktesting"
 	_ "k8s.io/kubernetes/pkg/apis/core/install"
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cm"
@@ -67,7 +68,6 @@ import (
 	"k8s.io/kubernetes/pkg/volume"
 	"k8s.io/kubernetes/pkg/volume/util/hostutil"
 	"k8s.io/kubernetes/pkg/volume/util/subpath"
-	"k8s.io/kubernetes/test/utils/ktesting"
 	netutils "k8s.io/utils/net"
 	"k8s.io/utils/ptr"
 )
@@ -5159,6 +5159,176 @@ func Test_generateAPIPodStatus(t *testing.T) {
 			inPlacePodLevelResourcesVerticalScalingEnabled: true,
 		},
 		{
+			name: "InPlacePodLevelResourcesVerticalScaling enabled, partial limits omitted from status",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
+						{
+							Name: "containerA",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:              resource.MustParse("100m"),
+									v1.ResourceMemory:           resource.MustParse("100Mi"),
+									v1.ResourceEphemeralStorage: resource.MustParse("500Mi"),
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:              resource.MustParse("200m"),
+									v1.ResourceMemory:           resource.MustParse("200Mi"),
+									v1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+								},
+							},
+						},
+						{
+							Name: "containerB",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    resource.MustParse("50m"),
+									v1.ResourceMemory: resource.MustParse("50Mi"),
+								},
+							},
+						},
+					},
+				},
+				Status: v1.PodStatus{
+					Phase: v1.PodPending,
+				},
+			},
+			currentStatus: sandboxReadyStatus,
+			expected: v1.PodStatus{
+				Phase:    v1.PodPending,
+				HostIP:   "127.0.0.1",
+				HostIPs:  []v1.HostIP{{IP: "127.0.0.1"}, {IP: "::1"}},
+				QOSClass: v1.PodQOSBurstable,
+				Conditions: []v1.PodCondition{
+					{Type: v1.PodInitialized, Status: v1.ConditionTrue},
+					{Type: v1.PodReady, Status: v1.ConditionTrue},
+					{Type: v1.ContainersReady, Status: v1.ConditionTrue},
+					{Type: v1.PodScheduled, Status: v1.ConditionTrue},
+				},
+				ContainerStatuses: []v1.ContainerStatus{
+					{
+						Name:  "containerA",
+						State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: ContainerCreating}},
+						Ready: true,
+					},
+					{
+						Name:  "containerB",
+						State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: ContainerCreating}},
+						Ready: true,
+					},
+				},
+				Resources: &v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceCPU:              resource.MustParse("150m"),
+						v1.ResourceMemory:           resource.MustParse("150Mi"),
+						v1.ResourceEphemeralStorage: resource.MustParse("500Mi"),
+					},
+					// cpu and memory limits are declared by only some containers, so they are omitted in status
+					Limits: v1.ResourceList{
+						v1.ResourceEphemeralStorage: resource.MustParse("1Gi"),
+					},
+				},
+				AllocatedResources: v1.ResourceList{
+					v1.ResourceCPU:              resource.MustParse("150m"),
+					v1.ResourceMemory:           resource.MustParse("150Mi"),
+					v1.ResourceEphemeralStorage: resource.MustParse("500Mi"),
+				},
+				InitContainerStatuses:      []v1.ContainerStatus{},
+				EphemeralContainerStatuses: []v1.ContainerStatus{},
+			},
+			expectedPodReadyToStartContainersCondition: v1.PodCondition{
+				Type:   v1.PodReadyToStartContainers,
+				Status: v1.ConditionTrue,
+			},
+			inPlacePodLevelResourcesVerticalScalingEnabled: true,
+		},
+		{
+			name: "InPlacePodLevelResourcesVerticalScaling enabled, partial container limits not omitted with pod level limits",
+			pod: &v1.Pod{
+				Spec: v1.PodSpec{
+					Resources: &v1.ResourceRequirements{
+						Limits: v1.ResourceList{
+							v1.ResourceCPU: resource.MustParse("4"),
+						},
+					},
+					Containers: []v1.Container{
+						{
+							Name: "containerA",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    resource.MustParse("100m"),
+									v1.ResourceMemory: resource.MustParse("100Mi"),
+								},
+								Limits: v1.ResourceList{
+									v1.ResourceCPU:    resource.MustParse("200m"),
+									v1.ResourceMemory: resource.MustParse("200Mi"),
+								},
+							},
+						},
+						{
+							Name: "containerB",
+							Resources: v1.ResourceRequirements{
+								Requests: v1.ResourceList{
+									v1.ResourceCPU:    resource.MustParse("50m"),
+									v1.ResourceMemory: resource.MustParse("50Mi"),
+								},
+							},
+						},
+					},
+				},
+				Status: v1.PodStatus{
+					Phase: v1.PodPending,
+				},
+			},
+			currentStatus: sandboxReadyStatus,
+			expected: v1.PodStatus{
+				Phase:    v1.PodPending,
+				HostIP:   "127.0.0.1",
+				HostIPs:  []v1.HostIP{{IP: "127.0.0.1"}, {IP: "::1"}},
+				QOSClass: v1.PodQOSBurstable,
+				Conditions: []v1.PodCondition{
+					{Type: v1.PodInitialized, Status: v1.ConditionTrue},
+					{Type: v1.PodReady, Status: v1.ConditionTrue},
+					{Type: v1.ContainersReady, Status: v1.ConditionTrue},
+					{Type: v1.PodScheduled, Status: v1.ConditionTrue},
+				},
+				ContainerStatuses: []v1.ContainerStatus{
+					{
+						Name:  "containerA",
+						State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: ContainerCreating}},
+						Ready: true,
+					},
+					{
+						Name:  "containerB",
+						State: v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: ContainerCreating}},
+						Ready: true,
+					},
+				},
+				// The pod-level cpu limit covers the container that omits one; the memory
+				// limit is not declared by every container and is not reported.
+				Resources: &v1.ResourceRequirements{
+					Requests: v1.ResourceList{
+						v1.ResourceCPU:    resource.MustParse("150m"),
+						v1.ResourceMemory: resource.MustParse("150Mi"),
+					},
+					Limits: v1.ResourceList{
+						v1.ResourceCPU: resource.MustParse("4"),
+					},
+				},
+				AllocatedResources: v1.ResourceList{
+					v1.ResourceCPU:    resource.MustParse("150m"),
+					v1.ResourceMemory: resource.MustParse("150Mi"),
+				},
+				InitContainerStatuses:      []v1.ContainerStatus{},
+				EphemeralContainerStatuses: []v1.ContainerStatus{},
+			},
+			expectedPodReadyToStartContainersCondition: v1.PodCondition{
+				Type:   v1.PodReadyToStartContainers,
+				Status: v1.ConditionTrue,
+			},
+			inPlacePodLevelResourcesVerticalScalingEnabled: true,
+		},
+		{
 			name: "InPlacePodLevelResourcesVerticalScaling enabled, running pod",
 			pod: &v1.Pod{
 				Spec: v1.PodSpec{
@@ -9290,6 +9460,148 @@ func TestMakeEnvironmentVariablesWithFileKeyRef(t *testing.T) {
 			errorContains: "couldn't parse env file",
 			setupFiles: func() []string {
 				return []string{} // No files created
+			},
+		},
+		// Regression test for https://github.com/kubernetes/kubernetes/issues/142662.
+		{
+			name: "file does not exist with optional flag",
+			container: &v1.Container{
+				Env: []v1.EnvVar{
+					{
+						Name: "DATABASE",
+						ValueFrom: &v1.EnvVarSource{
+							FileKeyRef: &v1.FileKeySelector{
+								VolumeName: "config-volume",
+								Path:       "nonexistent.env",
+								Key:        "DATABASE",
+								Optional:   new(true),
+							},
+						},
+					},
+				},
+			},
+			podVolumes: map[string]kubecontainer.VolumeInfo{
+				"config-volume": {
+					Mounter: &testVolumeMounter{path: tmpDir},
+				},
+			},
+			expectedEnvs: nil,
+			setupFiles: func() []string {
+				return []string{} // No files created
+			},
+		},
+		// Regression test for https://github.com/kubernetes/kubernetes/issues/142662.
+		{
+			name: "key with empty value is published",
+			container: &v1.Container{
+				Env: []v1.EnvVar{
+					{
+						Name: "EMPTY",
+						ValueFrom: &v1.EnvVarSource{
+							FileKeyRef: &v1.FileKeySelector{
+								VolumeName: "config-volume",
+								Path:       "empty.env",
+								Key:        "EMPTY",
+							},
+						},
+					},
+				},
+			},
+			podVolumes: map[string]kubecontainer.VolumeInfo{
+				"config-volume": {
+					Mounter: &testVolumeMounter{path: tmpDir},
+				},
+			},
+			expectedEnvs: []kubecontainer.EnvVar{
+				{Name: "EMPTY", Value: ""},
+			},
+			setupFiles: func() []string {
+				return []string{createEnvFile("empty.env", "EMPTY=''\n")}
+			},
+		},
+		// POSIX shell reads KEY= # comment as an empty assignment.
+		{
+			name: "whitespace and comment after equals sign is published as empty",
+			container: &v1.Container{
+				Env: []v1.EnvVar{
+					{
+						Name: "EMPTY",
+						ValueFrom: &v1.EnvVarSource{
+							FileKeyRef: &v1.FileKeySelector{
+								VolumeName: "config-volume",
+								Path:       "empty-comment.env",
+								Key:        "EMPTY",
+							},
+						},
+					},
+				},
+			},
+			podVolumes: map[string]kubecontainer.VolumeInfo{
+				"config-volume": {
+					Mounter: &testVolumeMounter{path: tmpDir},
+				},
+			},
+			expectedEnvs: []kubecontainer.EnvVar{
+				{Name: "EMPTY", Value: ""},
+			},
+			setupFiles: func() []string {
+				return []string{createEnvFile("empty-comment.env", "EMPTY= # comment\n")}
+			},
+		},
+		{
+			name: "value after whitespace following equals sign",
+			container: &v1.Container{
+				Env: []v1.EnvVar{
+					{
+						Name: "DATABASE",
+						ValueFrom: &v1.EnvVarSource{
+							FileKeyRef: &v1.FileKeySelector{
+								VolumeName: "config-volume",
+								Path:       "space.env",
+								Key:        "DATABASE",
+							},
+						},
+					},
+				},
+			},
+			podVolumes: map[string]kubecontainer.VolumeInfo{
+				"config-volume": {
+					Mounter: &testVolumeMounter{path: tmpDir},
+				},
+			},
+			expectedError: true,
+			errorContains: "couldn't parse env file",
+			setupFiles: func() []string {
+				return []string{createEnvFile("space.env", "DATABASE= 'db'\n")}
+			},
+		},
+		// optional only covers a missing file or key, never invalid syntax.
+		{
+			name: "value after whitespace following equals sign with optional flag",
+			container: &v1.Container{
+				Env: []v1.EnvVar{
+					{
+						Name: "DATABASE",
+						ValueFrom: &v1.EnvVarSource{
+							FileKeyRef: &v1.FileKeySelector{
+								VolumeName: "config-volume",
+								Path:       "space.env",
+								Key:        "DATABASE",
+								Optional:   new(true),
+							},
+						},
+					},
+				},
+			},
+			podVolumes: map[string]kubecontainer.VolumeInfo{
+				"config-volume": {
+					Mounter: &testVolumeMounter{path: tmpDir},
+				},
+			},
+			expectedError: true,
+			errorContains: "couldn't parse env file",
+			setupFiles: func() []string {
+				return []string{createEnvFile("space.env", "DATABASE= 'db'\n")}
 			},
 		},
 		{

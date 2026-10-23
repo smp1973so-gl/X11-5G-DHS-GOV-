@@ -17,6 +17,8 @@ limitations under the License.
 package queue
 
 import (
+	"slices"
+
 	v1 "k8s.io/api/core/v1"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -120,21 +122,22 @@ func (wf *workloadForest) getRootLookupInfo(logger klog.Logger, gpg *fwk.Generic
 			},
 		}, true
 	}
-	return wf.getRootLookupInfoForParentCPG(logger, *storedGPG.GetParentCompositePodGroupName(), storedGPG.GetNamespace())
+	return wf.getRootLookupInfoForParentCPG(logger, storedGPG.GetKey(), *storedGPG.GetParentCompositePodGroupName(), storedGPG.GetNamespace())
 }
 
 // getRootLookupInfoForParentCPG is a helper to traverse up the parent chain and return the lookup info of the root CompositePodGroup.
 // It should be called only when the CompositePodGroup feature gate is enabled.
-func (wf *workloadForest) getRootLookupInfoForParentCPG(logger klog.Logger, parentName, namespace string) (*framework.QueuedPodGroupInfo, bool) {
+func (wf *workloadForest) getRootLookupInfoForParentCPG(logger klog.Logger, startKey fwk.EntityKey, parentName, namespace string) (*framework.QueuedPodGroupInfo, bool) {
 	currParentName := parentName
-	visited := sets.New[fwk.EntityKey]()
+	visited := []fwk.EntityKey{startKey}
 	for {
 		cpgKey := fwk.CompositePodGroupKey(namespace, currParentName)
-		if visited.Has(cpgKey) {
-			utilruntime.HandleErrorWithLogger(logger, nil, "Cycle detected in composite pod group hierarchy when getting root info", "parentName", parentName, "namespace", namespace)
+		if slices.Contains(visited, cpgKey) {
+			visited = append(visited, cpgKey)
+			utilruntime.HandleErrorWithLogger(logger, nil, "Cycle detected in composite pod group hierarchy when getting root info", "parentName", parentName, "namespace", namespace, "cycle", visited)
 			return nil, false
 		}
-		visited.Insert(cpgKey)
+		visited = append(visited, cpgKey)
 
 		cpg, exists := wf.podGroups[cpgKey]
 		if !exists {
@@ -149,6 +152,7 @@ func (wf *workloadForest) getRootLookupInfoForParentCPG(logger klog.Logger, pare
 }
 
 // getLeafPodGroups returns all PodGroups that are leaf nodes in the subtree rooted at the given rootLookupInfo.
+// The returned children PodGroups are in no particular order; callers that need a deterministic order must sort the result.
 func (wf *workloadForest) getLeafPodGroups(logger klog.Logger, rootLookupInfo *framework.QueuedPodGroupInfo) []*schedulingv1beta1.PodGroup {
 	key := rootLookupInfo.GetKey()
 	if rootLookupInfo.GetType() == fwk.PodGroupKeyType {
@@ -196,6 +200,7 @@ func (wf *workloadForest) getLeafPodGroups(logger klog.Logger, rootLookupInfo *f
 
 // buildPodGroupInfo recursively constructs a PodGroupInfo representation for a given GenericPodGroup
 // and all its children, using the provided visited set to detect cycles in the hierarchy.
+// Children get sorted within NewPodGroupInfo() to keep their order deterministic.
 func (wf *workloadForest) buildPodGroupInfo(logger klog.Logger, gpg *fwk.GenericPodGroup, visited sets.Set[fwk.EntityKey]) *framework.PodGroupInfo {
 	key := gpg.GetKey()
 	if visited.Has(key) {
@@ -204,23 +209,15 @@ func (wf *workloadForest) buildPodGroupInfo(logger klog.Logger, gpg *fwk.Generic
 	}
 	visited.Insert(key)
 
-	pgi := &framework.PodGroupInfo{
-		GenericPodGroup: gpg,
-		Children:        make([]*framework.PodGroupInfo, 0),
-	}
-
-	childrenSet, ok := wf.children[key]
-	if !ok {
-		return pgi
-	}
-	for childKey := range childrenSet {
+	var children []*framework.PodGroupInfo
+	for childKey := range wf.children[key] {
 		if childGPG, ok := wf.podGroups[childKey]; ok {
 			if childInfo := wf.buildPodGroupInfo(logger, childGPG, visited); childInfo != nil {
-				pgi.Children = append(pgi.Children, childInfo)
+				children = append(children, childInfo)
 			}
 		}
 	}
-	return pgi
+	return framework.NewPodGroupInfo(gpg, children...)
 }
 
 // buildQueuedPodGroupInfo constructs a QueuedPodGroupInfo starting from the provided root lookup info,

@@ -81,7 +81,8 @@ func (r *Replay) Validate(req Request, resp Response) error {
 
 func (r *Replay) validateGet(req Request, resp Response) error {
 	opts := req.Get.Options
-	if opts.ResourceVersion == "" {
+	consistency := GetReadConsistency(opts)
+	if consistency == ConsistencyConsistent {
 		return nil
 	}
 	reqRV, err := r.versioner.ParseResourceVersion(opts.ResourceVersion)
@@ -103,7 +104,14 @@ func (r *Replay) validateGet(req Request, resp Response) error {
 }
 
 func (r *Replay) validateList(req Request, resp Response) error {
-	if req.List.Options.ResourceVersion == "" || resp.Err != nil {
+	if resp.Err != nil {
+		return nil
+	}
+	consistency, _, _, err := ListReadConsistency("", r.versioner, req.List.Options)
+	if err != nil {
+		return err
+	}
+	if consistency == ConsistencyConsistent {
 		return nil
 	}
 	if resp.Object == nil {
@@ -122,7 +130,7 @@ func (r *Replay) validateList(req Request, resp Response) error {
 		return fmt.Errorf("resource version %d not found in history", respRV)
 	}
 	expected := state.list(req.Key, req.List.Options)
-	if !reflect.DeepEqual(expected, resp) {
+	if !state.equalListResponse(req.Key, req.List.Options, expected, resp) {
 		return fmt.Errorf("list response at RV %d differs (-want +got):\n%s", respRV, cmp.Diff(expected, resp))
 	}
 	return nil
@@ -189,21 +197,4 @@ func (r *Replay) EventsForRVs(request WatchRequest, rvRange *ResourceVersionRang
 
 func (r *Replay) ResourceVersion() uint64 {
 	return r.changes[len(r.changes)-1].ResourceVersion
-}
-
-func (r *Replay) LastWatchRV(request WatchRequest) (uint64, error) {
-	for i := len(r.changes) - 1; i >= 0; i-- {
-		change := r.changes[i]
-		if !keyInScope(request.Key, request.Options.Recursive, change.Key) {
-			continue
-		}
-		watchEvent, err := change.toWatchEvent(r.versioner, request.Options.Predicate)
-		if err != nil {
-			return 0, err
-		}
-		if watchEvent != nil {
-			return change.ResourceVersion, nil
-		}
-	}
-	return 0, nil
 }
