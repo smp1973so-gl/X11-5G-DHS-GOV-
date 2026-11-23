@@ -112,6 +112,10 @@ const (
 	// TieredReservationMemoryReservationPolicy enables tiered memory protection:
 	// memory.min for Guaranteed pods, memory.low for Burstable pods.
 	TieredReservationMemoryReservationPolicy MemoryReservationPolicy = "TieredReservation"
+	// SoftMemoryReservationPolicy protects memory requests of Guaranteed and Burstable pods with memory.low.
+	SoftMemoryReservationPolicy MemoryReservationPolicy = "Soft"
+	// HardMemoryReservationPolicy protects memory requests of Guaranteed and Burstable pods with memory.min.
+	HardMemoryReservationPolicy MemoryReservationPolicy = "Hard"
 )
 
 // CertificateKeyAlgorithmType defines the type of key algorithm used for certificate signing requests.
@@ -271,20 +275,22 @@ type KubeletConfiguration struct {
 	// +optional
 	ServerCertificateKeyAlgorithm *CertificateKeyAlgorithmType `json:"serverCertificateKeyAlgorithm,omitempty"`
 	// authentication specifies how requests to the Kubelet's server are authenticated.
-	// Defaults:
-	//   anonymous:
-	//     enabled: false
-	//   webhook:
-	//     enabled: true
-	//     cacheTTL: "2m"
+	//
+	//	Defaults:
+	//		anonymous:
+	//			enabled: false
+	//		webhook:
+	//			enabled: true
+	//			cacheTTL: "2m"
 	// +optional
 	Authentication KubeletAuthentication `json:"authentication"`
 	// authorization specifies how requests to the Kubelet's server are authorized.
-	// Defaults:
-	//   mode: Webhook
-	//   webhook:
-	//     cacheAuthorizedTTL: "5m"
-	//     cacheUnauthorizedTTL: "30s"
+	//
+	//	Defaults:
+	//		mode: Webhook
+	//		webhook:
+	//			cacheAuthorizedTTL: "5m"
+	//			cacheUnauthorizedTTL: "30s"
 	// +optional
 	Authorization KubeletAuthorization `json:"authorization"`
 	// registryPullQPS is the limit of registry pulls per second.
@@ -415,6 +421,8 @@ type KubeletConfiguration struct {
 	// imageMaximumGCAge is the maximum age an image can be unused before it is garbage collected.
 	// The default of this field is "0s", which disables this field--meaning images won't be garbage
 	// collected based on being unused for too long.
+	// It also applies to the seccomp profiles of type OCI that the kubelet pulled (SecurityProfileOCI
+	// feature gate), which are removed once no pod has referenced them for this long.
 	// Default: "0s" (disabled)
 	// +optional
 	ImageMaximumGCAge metav1.Duration `json:"imageMaximumGCAge,omitempty"`
@@ -931,7 +939,7 @@ type KubeletConfiguration struct {
 	// 1. Duplicates, the same NUMA node, and memory type, but with a different value.
 	// 2. zero limits for any memory type.
 	// 3. NUMAs nodes IDs that do not exist under the machine.
-	// 4. memory types except for memory and hugepages-<size>
+	// 4. memory types except for memory and hugepages-SIZE
 	//
 	// Default: nil
 	// +optional
@@ -961,9 +969,29 @@ type KubeletConfiguration struct {
 	// "None" (default): The kubelet does not set memory.min for containers and pods,
 	// ensuring no hard memory is locked by the kernel.
 	// "TieredReservation": The kubelet sets cgroup v2 memory.min for Guaranteed pods and memory.low for Burstable pods based on memory requests.
-	// Guaranteed memory is never reclaimed by the kernel; Burstable memory is preferentially retained but may be reclaimed under extreme pressure.
+	// Guaranteed memory is never reclaimed by the kernel, and Burstable memory is
+	// preferentially retained but may be reclaimed under extreme pressure.
+	// "Soft": The kubelet sets memory.low for Guaranteed and Burstable pods and containers based on memory requests. Requested memory is preferentially retained but may be reclaimed under extreme pressure.
+	// "Hard": The kubelet sets memory.min for Guaranteed and Burstable pods and containers based on memory requests. Requested memory is never reclaimed by the kernel.
+	// Soft and Hard require the NodeMemoryReservationPolicy feature gate.
+	// When reservation is enabled, unused QoS-root protection can also reduce reclaim of
+	// BestEffort page cache because cgroup v2 memory protection is hierarchical.
 	// See https://kep.k8s.io/2570 for more details.
 	// Default: None
+	// Recreate affected pods when enabling protection or switching between
+	// TieredReservation, Soft, and Hard.
+	// When switching from Soft to TieredReservation, existing Guaranteed pods retain
+	// memory.low until recreated. They share the kubepods root's soft protection
+	// with the Burstable QoS cgroup, which can reduce effective protection for Burstable pods.
+	// Disabling protection clears QoS cgroup protection at kubelet startup,
+	// but existing pod and container values may remain.
+	//
+	// Before downgrading to a kubelet version that does not support Soft or Hard,
+	// set memoryReservationPolicy to TieredReservation or None and remove
+	// NodeMemoryReservationPolicy from the kubelet configuration and --feature-gates
+	// flags, even if set to false.
+	// For Hard, restart the current kubelet and verify that the Burstable QoS
+	// cgroup's memory.min is zero before downgrading.
 	// +featureGate=MemoryQoS
 	// +optional
 	MemoryReservationPolicy MemoryReservationPolicy `json:"memoryReservationPolicy,omitempty"`
@@ -1122,6 +1150,8 @@ type MemorySwapConfiguration struct {
 	// swapBehavior configures swap memory available to container workloads. May be one of
 	// "", "NoSwap": workloads can not use swap, default option.
 	// "LimitedSwap": workload swap usage is limited. The swap limit is proportionate to the container's memory request.
+	// "WorkloadControlledSwap": workloads can use swap only up to the swap limit they set in
+	// resources.limits.swap, and not at all without one. Requires the WorkloadControlledSwap feature gate.
 	// +featureGate=NodeSwap
 	// +optional
 	SwapBehavior string `json:"swapBehavior,omitempty"`
@@ -1169,9 +1199,9 @@ type CredentialProvider struct {
 	//
 	// Each entry in matchImages is a pattern which can optionally contain a port and a path.
 	// Globs can be used in the domain, but not in the port or the path. Globs are supported
-	// as subdomains like '*.k8s.io' or 'k8s.*.io', and top-level-domains such as 'k8s.*'.
-	// Matching partial subdomains like 'app*.k8s.io' is also supported. Each glob can only match
-	// a single subdomain segment, so *.io does not match *.k8s.io.
+	// as subdomains like `*.k8s.io` or `k8s.*.io`, and top-level-domains such as `k8s.*`.
+	// Matching partial subdomains like `app*.k8s.io` is also supported. Each glob can only match
+	// a single subdomain segment, so `*.io` does not match `*.k8s.io`.
 	//
 	// A match exists between an image and a matchImage when all of the below are true:
 	// - Both contain the same number of domain parts and each part matches.
@@ -1179,11 +1209,11 @@ type CredentialProvider struct {
 	// - If the imageMatch contains a port, then the port must match in the image as well.
 	//
 	// Example values of matchImages:
-	//   - 123456789.dkr.ecr.us-east-1.amazonaws.com
-	//   - *.azurecr.io
-	//   - gcr.io
-	//   - *.*.registry.io
-	//   - registry.io:8080/path
+	//   - `123456789.dkr.ecr.us-east-1.amazonaws.com`
+	//   - `*.azurecr.io`
+	//   - `gcr.io`
+	//   - `*.*.registry.io`
+	//   - `registry.io:8080/path`
 	MatchImages []string `json:"matchImages"`
 
 	// defaultCacheDuration is the default duration the plugin will cache credentials in-memory

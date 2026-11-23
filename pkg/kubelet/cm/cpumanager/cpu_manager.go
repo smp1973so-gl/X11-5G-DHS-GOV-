@@ -30,6 +30,7 @@ import (
 	resourcehelper "k8s.io/component-helpers/resource"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 	"k8s.io/klog/v2"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 
 	kubefeatures "k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cm/containermap"
@@ -161,6 +162,11 @@ type manager struct {
 	// stateFileDirectory holds the directory where the state file for checkpoints is held.
 	stateFileDirectory string
 
+	// pendingResize is the resize admission in progress, if any. One is enough:
+	// the allocation manager admits one pod at a time and completes each
+	// admission before it starts the next one.
+	pendingResize *resizeTransaction
+
 	// allCPUs is the set of online CPUs as reported by the system
 	allCPUs cpuset.CPUSet
 
@@ -284,7 +290,7 @@ func (m *manager) Allocate(ctx context.Context, p *v1.Pod, c *v1.Container, oper
 	defer m.Unlock()
 
 	// Call down into the policy to assign this container CPUs if required.
-	err := m.policy.Allocate(logger, m.state, p, c, operation)
+	err := m.policy.Allocate(logger, m.admissionStateLocked(logger, p, operation), p, c, operation)
 	if err != nil {
 		logger.Error(err, "policy error")
 		return err
@@ -301,7 +307,7 @@ func (m *manager) AllocatePod(logger klog.Logger, pod *v1.Pod, operation lifecyc
 	defer m.Unlock()
 
 	// Call down into the policy to assign this container CPUs if required.
-	if err := m.policy.AllocatePod(logger, m.state, pod, operation); err != nil {
+	if err := m.policy.AllocatePod(logger, m.admissionStateLocked(logger, pod, operation), pod, operation); err != nil {
 		logger.Error(err, "AllocatePod error", "pod", klog.KObj(pod))
 		return err
 	}
@@ -341,6 +347,7 @@ func (m *manager) policyRemoveContainerByID(logger klog.Logger, containerID stri
 	if err == nil {
 		m.lastUpdateState.Delete(podUID, containerName)
 		m.containerMap.RemoveByContainerID(containerID)
+		m.removeFromResizeTransactionLocked(podUID, containerName)
 	}
 
 	return err
@@ -351,6 +358,7 @@ func (m *manager) policyRemoveContainerByRef(logger klog.Logger, podUID string, 
 	if err == nil {
 		m.lastUpdateState.Delete(podUID, containerName)
 		m.containerMap.RemoveByContainerRef(podUID, containerName)
+		m.removeFromResizeTransactionLocked(podUID, containerName)
 	}
 
 	return err
@@ -363,15 +371,21 @@ func (m *manager) State() state.Reader {
 func (m *manager) GetTopologyHints(logger klog.Logger, pod *v1.Pod, container *v1.Container, operation lifecycle.Operation) map[string][]topologymanager.TopologyHint {
 	// Garbage collect any stranded resources before providing TopologyHints
 	m.removeStaleState(logger)
+	m.Lock()
+	s := m.admissionStateLocked(logger, pod, operation)
+	m.Unlock()
 	// Delegate to active policy
-	return m.policy.GetTopologyHints(logger, m.state, pod, container, operation)
+	return m.policy.GetTopologyHints(logger, s, pod, container, operation)
 }
 
 func (m *manager) GetPodTopologyHints(logger klog.Logger, pod *v1.Pod, operation lifecycle.Operation) map[string][]topologymanager.TopologyHint {
 	// Garbage collect any stranded resources before providing TopologyHints
 	m.removeStaleState(logger)
+	m.Lock()
+	s := m.admissionStateLocked(logger, pod, operation)
+	m.Unlock()
 	// Delegate to active policy
-	return m.policy.GetPodTopologyHints(logger, m.state, pod, operation)
+	return m.policy.GetPodTopologyHints(logger, s, pod, operation)
 }
 
 func (m *manager) GetAllocatableCPUs() cpuset.CPUSet {
@@ -410,7 +424,7 @@ func (m *manager) removeStaleState(rootLogger klog.Logger) {
 	activeContainers := make(map[string]map[string]struct{})
 	for _, pod := range activePods {
 		activeContainers[string(pod.UID)] = make(map[string]struct{})
-		for _, container := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
+		for container := range podutil.ContainerIter(&pod.Spec, podutil.InitContainers|podutil.Containers) {
 			activeContainers[string(pod.UID)][container.Name] = struct{}{}
 		}
 	}
@@ -466,9 +480,7 @@ func (m *manager) reconcileState(ctx context.Context) (success []reconciledConta
 			continue
 		}
 
-		allContainers := pod.Spec.InitContainers
-		allContainers = append(allContainers, pod.Spec.Containers...)
-		for _, container := range allContainers {
+		for container := range podutil.ContainerIter(&pod.Spec, podutil.InitContainers|podutil.Containers) {
 			logger := klog.LoggerWithValues(podLogger, "containerName", container.Name)
 
 			containerID, err := findContainerIDByName(&pstatus, container.Name)

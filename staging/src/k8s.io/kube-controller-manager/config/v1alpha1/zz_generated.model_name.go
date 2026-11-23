@@ -107,6 +107,11 @@ func (in HPAControllerConfiguration) OpenAPIModelName() string {
 }
 
 // OpenAPIModelName returns the OpenAPI model name for this type.
+func (in ImperativeEvictionResponderControllerConfiguration) OpenAPIModelName() string {
+	return "io.k8s.kube-controller-manager.config.v1alpha1.ImperativeEvictionResponderControllerConfiguration"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
 func (in JobControllerConfiguration) OpenAPIModelName() string {
 	return "io.k8s.kube-controller-manager.config.v1alpha1.JobControllerConfiguration"
 }
@@ -174,6 +179,11 @@ func (in ResourceQuotaControllerConfiguration) OpenAPIModelName() string {
 // OpenAPIModelName returns the OpenAPI model name for this type.
 func (in SAControllerConfiguration) OpenAPIModelName() string {
 	return "io.k8s.kube-controller-manager.config.v1alpha1.SAControllerConfiguration"
+}
+
+// OpenAPIModelName returns the OpenAPI model name for this type.
+func (in ServiceServingSignerConfiguration) OpenAPIModelName() string {
+	return "io.k8s.kube-controller-manager.config.v1alpha1.ServiceServingSignerConfiguration"
 }
 
 // OpenAPIModelName returns the OpenAPI model name for this type.

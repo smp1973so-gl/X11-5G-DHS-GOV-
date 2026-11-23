@@ -27,6 +27,9 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
 	"k8s.io/kubernetes/pkg/scheduler/metrics"
 
@@ -52,7 +55,7 @@ func NewPodGroupEvaluator(fh fwk.Handle) *PodGroupEvaluator {
 func (ev *PodGroupEvaluator) evaluate(ctx context.Context, preemptorType fwk.EntityKeyType, potentialVictims []fwk.PreemptionVictim, podGroupSchedulingFunc fwk.PodGroupSchedulingFunc) (res *selectVictimsResult, status *fwk.Status) {
 	startTime := time.Now()
 	defer func() {
-		metrics.PreemptionEvaluationDuration.WithLabelValues(metrics.EntityTypeToLabel(preemptorType), status.Code().String()).Observe(metrics.SinceInSeconds(startTime))
+		metrics.PreemptionEvaluationDuration.WithLabelValues(metrics.EntityTypeToLabel(preemptorType), status.Code().String(), metrics.OperationInitialPlacement).Observe(metrics.SinceInSeconds(startTime))
 	}()
 
 	return ev.selectVictimsOnDomain(ctx, potentialVictims, podGroupSchedulingFunc)
@@ -185,8 +188,13 @@ func (ev *PodGroupEvaluator) selectVictimsOnDomain(
 		}
 	}
 
+	innerState := ev.Handle.NewPodGroupCycleState()
+	NewPodGroupPreemptionState(potentialVictims).WriteToPodGroupCycleState(innerState)
 	// If the scheduling failed after removing all potential victims, return the status.
-	podGroupAssignments, status := podGroupSchedulingFunc(ctx)
+	podGroupAssignments, status := podGroupSchedulingFunc(ctx, innerState)
+	// ProposedAssignments retains per-pod CycleStates that reference innerState during reprieveVictim,
+	// so delete PodGroupPreemptionStateKey once the inner scheduling pass completes.
+	innerState.Delete(PodGroupPreemptionStateKey)
 	if !status.IsSuccess() {
 		return nil, status
 	}
@@ -255,7 +263,20 @@ func (ev *PodGroupEvaluator) selectVictimsOnDomain(
 			// Simulate assuming a preemptor pod and reserving stateful plugins resources.
 			// We do not need to add the preemptor pod to the cycle state of upcoming preemptor pods.
 			// This is because the cycle state was created with them already assumed.
-			if err = mutableLister.AddPod(assignment.GetPodInfo(), assignment.GetNodeName()); err != nil {
+			podInfo := assignment.GetPodInfo()
+			if utilfeature.DefaultFeatureGate.Enabled(features.DRANodeAllocatableResources) {
+				// The pod's extra node allocatable resources for the node are only in the cycle state.
+				if extraResources := framework.GetExtraNodeAllocatableResources(assignment.GetCycleState(), assignment.GetNodeName()); len(extraResources) > 0 {
+					assumedPod := assignment.GetPod().DeepCopy()
+					// As for the assumed pod, so NodeInfo counts the entries, which it ignores on unbound pods.
+					assumedPod.Spec.NodeName = assignment.GetNodeName()
+					assumedPod.Status.ExtraNodeAllocatableResources = extraResources
+					if podInfo, err = framework.NewPodInfo(assumedPod); err != nil {
+						return false, err
+					}
+				}
+			}
+			if err = mutableLister.AddPod(podInfo, assignment.GetNodeName()); err != nil {
 				return false, err
 			}
 			ev.Handle.RunReservePluginsReserve(ctx, assignment.GetCycleState(), assignment.GetPod(), nodeInfo.Node().GetName())

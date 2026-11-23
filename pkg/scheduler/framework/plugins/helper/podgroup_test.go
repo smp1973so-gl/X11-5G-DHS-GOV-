@@ -23,7 +23,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	v1 "k8s.io/api/core/v1"
-	schedulingv1alpha3 "k8s.io/api/scheduling/v1alpha3"
 	schedulingv1beta1 "k8s.io/api/scheduling/v1beta1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
@@ -33,59 +32,6 @@ import (
 	internalcache "k8s.io/kubernetes/pkg/scheduler/backend/cache"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 )
-
-func TestMatchingSchedulingGroup(t *testing.T) {
-	testCases := []struct {
-		name     string
-		pod1     *v1.Pod
-		pod2     *v1.Pod
-		expected bool
-	}{
-		{
-			name:     "same pod with schedulingGroup",
-			pod1:     st.MakePod().Name("pod1").Namespace("test").PodGroupName("name").Obj(),
-			pod2:     st.MakePod().Name("pod1").Namespace("test").PodGroupName("name").Obj(),
-			expected: true,
-		},
-		{
-			name:     "different pods, same schedulingGroup",
-			pod1:     st.MakePod().Name("pod1").Namespace("test").PodGroupName("name").Obj(),
-			pod2:     st.MakePod().Name("pod2").Namespace("test").PodGroupName("name").Obj(),
-			expected: true,
-		},
-		{
-			name:     "same pod but no schedulingGroup",
-			pod1:     st.MakePod().Name("pod1").Namespace("test").Obj(),
-			pod2:     st.MakePod().Name("pod1").Namespace("test").Obj(),
-			expected: false,
-		},
-		{
-			name:     "different pods, only one with schedulingGroup",
-			pod1:     st.MakePod().Name("pod1").Namespace("test").PodGroupName("name").Obj(),
-			pod2:     st.MakePod().Name("pod2").Namespace("test").Obj(),
-			expected: false,
-		},
-		{
-			name:     "same schedulingGroup but different namespaces",
-			pod1:     st.MakePod().Name("pod1").Namespace("test1").PodGroupName("name").Obj(),
-			pod2:     st.MakePod().Name("pod2").Namespace("test2").PodGroupName("name").Obj(),
-			expected: false,
-		},
-		{
-			name:     "same namespace but different pod group",
-			pod1:     st.MakePod().Name("pod1").Namespace("test").PodGroupName("name1").Obj(),
-			pod2:     st.MakePod().Name("pod2").Namespace("test").PodGroupName("name2").Obj(),
-			expected: false,
-		},
-	}
-	for _, tt := range testCases {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := MatchingSchedulingGroup(tt.pod1, tt.pod2); got != tt.expected {
-				t.Errorf("MatchingSchedulingGroup() = %v, want %v", got, tt.expected)
-			}
-		})
-	}
-}
 
 type fakeSharedLister struct {
 	fwk.SharedLister
@@ -138,7 +84,7 @@ func TestGetPodGroupStates(t *testing.T) {
 	testCases := []struct {
 		name               string
 		podGroups          []*schedulingv1beta1.PodGroup
-		compositePodGroups []*schedulingv1alpha3.CompositePodGroup
+		compositePodGroups []*schedulingv1beta1.CompositePodGroup
 		rootEntityKey      fwk.EntityKey
 		faultyEntityKeys   []fwk.EntityKey
 		wantErrCount       int
@@ -156,7 +102,7 @@ func TestGetPodGroupStates(t *testing.T) {
 				st.MakePodGroup().Name("pg1").Namespace("test").ParentCompositePodGroup("cpg-root").Obj(),
 				st.MakePodGroup().Name("pg2").Namespace("test").ParentCompositePodGroup("cpg-root").Obj(),
 			},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{
 				st.MakeCompositePodGroup().Name("cpg-root").Namespace("test").Obj(),
 			},
 			rootEntityKey: fwk.CompositePodGroupKey("test", "cpg-root"),
@@ -167,7 +113,7 @@ func TestGetPodGroupStates(t *testing.T) {
 				st.MakePodGroup().Name("pg1").Namespace("test").ParentCompositePodGroup("cpg-root").Obj(),
 				st.MakePodGroup().Name("pg2").Namespace("test").ParentCompositePodGroup("cpg1").Obj(),
 			},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{
 				st.MakeCompositePodGroup().Name("cpg-root").Namespace("test").Obj(),
 				st.MakeCompositePodGroup().Name("cpg1").Namespace("test").ParentCompositePodGroup("cpg-root").Obj(),
 			},
@@ -176,7 +122,7 @@ func TestGetPodGroupStates(t *testing.T) {
 		{
 			name:      "root is CompositePodGroup and has no leaves",
 			podGroups: []*schedulingv1beta1.PodGroup{},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{
 				st.MakeCompositePodGroup().Name("cpg-root").Namespace("test").Obj(),
 			},
 			rootEntityKey: fwk.CompositePodGroupKey("test", "cpg-root"),
@@ -186,7 +132,7 @@ func TestGetPodGroupStates(t *testing.T) {
 			podGroups: []*schedulingv1beta1.PodGroup{
 				st.MakePodGroup().Name("pg-leaf").Namespace("test").ParentCompositePodGroup("cpg-mid2").Obj(),
 			},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{
 				st.MakeCompositePodGroup().Name("cpg-root").Namespace("test").Obj(),
 				st.MakeCompositePodGroup().Name("cpg-mid1").Namespace("test").ParentCompositePodGroup("cpg-root").Obj(),
 				st.MakeCompositePodGroup().Name("cpg-mid2").Namespace("test").ParentCompositePodGroup("cpg-root").Obj(),
@@ -200,7 +146,7 @@ func TestGetPodGroupStates(t *testing.T) {
 		{
 			name:      "root is CompositePodGroup and multiple entity keys are missing",
 			podGroups: []*schedulingv1beta1.PodGroup{},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{
 				st.MakeCompositePodGroup().Name("cpg-root").Namespace("test").Obj(),
 				st.MakeCompositePodGroup().Name("cpg-mid1").Namespace("test").ParentCompositePodGroup("cpg-root").Obj(),
 				st.MakeCompositePodGroup().Name("cpg-mid2").Namespace("test").ParentCompositePodGroup("cpg-root").Obj(),
@@ -265,7 +211,7 @@ func TestGetPodGroupStates_EarlyBreak(t *testing.T) {
 		st.MakePodGroup().Name("pg2").Namespace("test").ParentCompositePodGroup("cpg-root").Obj(),
 		st.MakePodGroup().Name("pg3").Namespace("test").ParentCompositePodGroup("cpg-root").Obj(),
 	}
-	compositePodGroups := []*schedulingv1alpha3.CompositePodGroup{
+	compositePodGroups := []*schedulingv1beta1.CompositePodGroup{
 		st.MakeCompositePodGroup().Name("cpg-root").Namespace("test").Obj(),
 	}
 
@@ -290,7 +236,7 @@ func TestTraverseHierarchyUp(t *testing.T) {
 		name                      string
 		disableCompositePodGroups bool
 		podGroups                 []*schedulingv1beta1.PodGroup
-		compositePodGroups        []*schedulingv1alpha3.CompositePodGroup
+		compositePodGroups        []*schedulingv1beta1.CompositePodGroup
 		startKey                  fwk.EntityKey
 		// stopAt makes the consumer break out of the loop after this group, if non-empty.
 		stopAt   string
@@ -311,7 +257,7 @@ func TestTraverseHierarchyUp(t *testing.T) {
 			podGroups: []*schedulingv1beta1.PodGroup{
 				st.MakePodGroup().Name("pg1").Namespace(ns).ParentCompositePodGroup("cpg1").Obj(),
 			},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{
 				st.MakeCompositePodGroup().Name("cpg1").Namespace(ns).ParentCompositePodGroup("cpg2").Obj(),
 				st.MakeCompositePodGroup().Name("cpg2").Namespace(ns).Obj(),
 			},
@@ -324,7 +270,7 @@ func TestTraverseHierarchyUp(t *testing.T) {
 		},
 		{
 			name: "start from a CompositePodGroup",
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{
 				st.MakeCompositePodGroup().Name("cpg1").Namespace(ns).ParentCompositePodGroup("cpg2").Obj(),
 				st.MakeCompositePodGroup().Name("cpg2").Namespace(ns).Obj(),
 			},
@@ -339,7 +285,7 @@ func TestTraverseHierarchyUp(t *testing.T) {
 			podGroups: []*schedulingv1beta1.PodGroup{
 				st.MakePodGroup().Name("pg1").Namespace(ns).ParentCompositePodGroup("cpg1").Obj(),
 			},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{
 				st.MakeCompositePodGroup().Name("cpg1").Namespace(ns).ParentCompositePodGroup("cpg2").Obj(),
 				st.MakeCompositePodGroup().Name("cpg2").Namespace(ns).Obj(),
 			},
@@ -370,7 +316,7 @@ func TestTraverseHierarchyUp(t *testing.T) {
 			podGroups: []*schedulingv1beta1.PodGroup{
 				st.MakePodGroup().Name("pg1").Namespace(ns).ParentCompositePodGroup("cpg1").Obj(),
 			},
-			compositePodGroups: []*schedulingv1alpha3.CompositePodGroup{
+			compositePodGroups: []*schedulingv1beta1.CompositePodGroup{
 				st.MakeCompositePodGroup().Name("cpg1").Namespace(ns).Obj(),
 			},
 			startKey: fwk.PodGroupKey(ns, "pg1"),

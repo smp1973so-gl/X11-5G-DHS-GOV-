@@ -17,12 +17,15 @@ limitations under the License.
 package preemption
 
 import (
+	"cmp"
+
 	v1 "k8s.io/api/core/v1"
 	policy "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	policylisters "k8s.io/client-go/listers/policy/v1"
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/framework"
 )
 
 // PodTerminatingByPreemption returns true if the pod is in the termination state caused by scheduler preemption.
@@ -37,6 +40,17 @@ func PodTerminatingByPreemption(p *v1.Pod) bool {
 		}
 	}
 	return false
+}
+
+// NominatedNodeName returns the node that pod is nominated to. When fh
+// implements framework.NominatedNodeNameGetter (which returns the in-memory
+// nomination from PodNominator when DRAPreemption is enabled), it delegates to
+// fh. Otherwise, it returns pod.Status.NominatedNodeName.
+func NominatedNodeName(fh fwk.Handle, pod *v1.Pod) string {
+	if nominator, ok := fh.(framework.NominatedNodeNameGetter); ok {
+		return nominator.NominatedNodeName(pod)
+	}
+	return pod.Status.NominatedNodeName
 }
 
 // MoreImportantVictim decides which of two preemption units is considered more critical.
@@ -61,19 +75,8 @@ func PodTerminatingByPreemption(p *v1.Pod) bool {
 //     If group types and sizes are equal, the group that started earlier (has the oldest pod)
 //     is more important.
 func MoreImportantVictim(vi1, vi2 Victim) bool {
-	if vi1.Priority() != vi2.Priority() {
-		return vi1.Priority() > vi2.Priority()
-	}
-
-	rank1 := victimRank(vi1)
-	rank2 := victimRank(vi2)
-
-	if rank1 != rank2 {
-		return rank1 > rank2
-	}
-
-	if len(vi1.Pods()) != len(vi2.Pods()) {
-		return len(vi1.Pods()) > len(vi2.Pods())
+	if c := compareVictimStructuralImportance(vi1, vi2); c != 0 {
+		return c > 0
 	}
 
 	t1, t2 := vi1.EarliestStartTime(), vi2.EarliestStartTime()
@@ -100,6 +103,19 @@ func victimRank(vi Victim) int {
 	default:
 		return 1
 	}
+}
+
+// compareVictimStructuralImportance compares two victims on structural importance:
+// Priority, Workload Type Rank (CompositePodGroup > PodGroup > Pod), and Group Size.
+// Returns > 0 if vi1 is more important, < 0 if vi2 is more important, and 0 if equal.
+func compareVictimStructuralImportance(vi1, vi2 Victim) int {
+	if c := cmp.Compare(vi1.Priority(), vi2.Priority()); c != 0 {
+		return c
+	}
+	if c := cmp.Compare(victimRank(vi1), victimRank(vi2)); c != 0 {
+		return c
+	}
+	return cmp.Compare(len(vi1.Pods()), len(vi2.Pods()))
 }
 
 // FilterVictimsWithPDBViolation groups "victims" into "violatingVictims"

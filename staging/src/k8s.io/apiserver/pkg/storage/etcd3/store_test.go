@@ -123,8 +123,8 @@ func TestCreateWithKeyExist(t *testing.T) {
 }
 
 func TestGet(t *testing.T) {
-	ctx, store, _ := testSetup(t)
-	storagetesting.RunTestGet(ctx, t, store)
+	ctx, store, client := testSetup(t)
+	storagetesting.RunTestGet(ctx, t, store, increaseRVFunc(client.Client))
 }
 
 func TestUnconditionalDelete(t *testing.T) {
@@ -282,6 +282,10 @@ type storeWithPrefixTransformer struct {
 	*store
 }
 
+func (s *storeWithPrefixTransformer) UnderlyingStorage() storage.Interface {
+	return s.store
+}
+
 func (s *storeWithPrefixTransformer) UpdatePrefixTransformer(modifier storagetesting.PrefixTransformerModifier) func() {
 	originalTransformer := s.transformer.(*storagetesting.PrefixTransformer)
 	transformer := *originalTransformer
@@ -338,6 +342,21 @@ func TestGuaranteedUpdateWithSuggestionAndConflict(t *testing.T) {
 func TestTransformationFailure(t *testing.T) {
 	ctx, store, _ := testSetup(t)
 	storagetesting.RunTestTransformationFailure(ctx, t, &storeWithPrefixTransformer{store})
+}
+
+func TestOptimisticConcurrency(t *testing.T) {
+	ctx, store, client := testSetup(t)
+	storagetesting.RunTestOptimisticConcurrency(ctx, t, &storeWithPrefixTransformer{store}, false, client.Kubernetes.(*storagetesting.KubernetesRecorder))
+}
+
+func TestDeleteOnce(t *testing.T) {
+	ctx, store, _ := testSetup(t)
+	storagetesting.RunTestDeleteOnce(ctx, t, store, "", store.codec)
+}
+
+func TestUpdateOnce(t *testing.T) {
+	ctx, store, _ := testSetup(t)
+	storagetesting.RunTestUpdateOnce(ctx, t, store, "", store.codec)
 }
 
 func TestList(t *testing.T) {

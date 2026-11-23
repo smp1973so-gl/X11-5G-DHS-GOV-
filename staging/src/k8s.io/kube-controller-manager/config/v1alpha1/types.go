@@ -133,6 +133,9 @@ type KubeControllerManagerConfiguration struct {
 	GarbageCollectorController GarbageCollectorControllerConfiguration
 	// HPAControllerConfiguration holds configuration for HPAController related features.
 	HPAController HPAControllerConfiguration
+	// ImperativeEvictionResponderControllerConfiguration holds configuration for
+	// ImperativeEvictionResponderController related features.
+	ImperativeEvictionResponderController ImperativeEvictionResponderControllerConfiguration
 	// JobControllerConfiguration holds configuration for JobController related features.
 	JobController JobControllerConfiguration
 	// CronJobControllerConfiguration holds configuration for CronJobController related features.
@@ -168,6 +171,9 @@ type KubeControllerManagerConfiguration struct {
 	// ServiceControllerConfiguration holds configuration for ServiceController
 	// related features.
 	ServiceController serviceconfigv1alpha1.ServiceControllerConfiguration
+	// ServiceServingSigner holds configuration for ServiceServingSigner related
+	// features.
+	ServiceServingSigner ServiceServingSignerConfiguration
 	// TTLAfterFinishedControllerConfiguration holds configuration for
 	// TTLAfterFinishedController related features.
 	TTLAfterFinishedController TTLAfterFinishedControllerConfiguration
@@ -369,6 +375,15 @@ type HPAControllerConfiguration struct {
 	HorizontalPodAutoscalerInitialReadinessDelay metav1.Duration
 }
 
+// ImperativeEvictionResponderControllerConfiguration contains elements configuring
+// the imperative eviction responder controller.
+type ImperativeEvictionResponderControllerConfiguration struct {
+	// ConcurrentImperativeEvictionResponderSyncs is the number of eviction object syncing and imperative
+	// eviction operations that will be done concurrently. Larger number = bigger throughput of imperative eviction
+	// calls (pods/<name>/eviction subresource) and faster Eviction status updating, but more CPU (and network) load.
+	ConcurrentImperativeEvictionResponderSyncs int32
+}
+
 // JobControllerConfiguration contains elements describing JobController.
 type JobControllerConfiguration struct {
 	// concurrentJobSyncs is the number of job objects that are
@@ -498,6 +513,23 @@ type SAControllerConfiguration struct {
 	// rootCAFile is the root certificate authority will be included in service
 	// account's token secret. This must be a valid PEM-encoded CA bundle.
 	RootCAFile string
+}
+
+// ServiceServingSignerConfiguration contains configuration knobs for a generic PodCertsSigner
+// controller.
+type ServiceServingSignerConfiguration struct {
+	// CACertPath is the path to the signer's signing certificate file. The certificate
+	// is expected to be PEM-formatted.
+	CACertPath string
+	// CAKeyPath is the path to the signner's signing key file. The key is expected
+	// to be PEM-formatted.
+	CAKeyPath string
+	// CABundlePath is the path to the trust bundle file for the signer. Expects
+	// PEM formatted content.
+	CABundlePath string
+	// ClusterDomain is the service domain for the cluster. Required for
+	// DNS SANs of the issued certificates.
+	ClusterDomain string
 }
 
 // TTLAfterFinishedControllerConfiguration contains elements describing TTLAfterFinishedController.

@@ -21,6 +21,7 @@ import (
 	cpconfig "k8s.io/cloud-provider/config"
 	serviceconfig "k8s.io/cloud-provider/controllers/service/config"
 	cmconfig "k8s.io/controller-manager/config"
+	podcertssignerconfig "k8s.io/kubernetes/pkg/controller/certificates/podcertssigner/config"
 	csrsigningconfig "k8s.io/kubernetes/pkg/controller/certificates/signer/config"
 	cronjobconfig "k8s.io/kubernetes/pkg/controller/cronjob/config"
 	daemonconfig "k8s.io/kubernetes/pkg/controller/daemon/config"
@@ -32,6 +33,7 @@ import (
 	endpointslicemirroringconfig "k8s.io/kubernetes/pkg/controller/endpointslicemirroring/config"
 	evictionrequestconfig "k8s.io/kubernetes/pkg/controller/evictionrequest/config"
 	garbagecollectorconfig "k8s.io/kubernetes/pkg/controller/garbagecollector/config"
+	imperativeevictionresponder "k8s.io/kubernetes/pkg/controller/imperativeevictionresponder/config"
 	jobconfig "k8s.io/kubernetes/pkg/controller/job/config"
 	namespaceconfig "k8s.io/kubernetes/pkg/controller/namespace/config"
 	nodeipamconfig "k8s.io/kubernetes/pkg/controller/nodeipam/config"
@@ -106,6 +108,9 @@ type KubeControllerManagerConfiguration struct {
 	GarbageCollectorController garbagecollectorconfig.GarbageCollectorControllerConfiguration
 	// HPAControllerConfiguration holds configuration for HPAController related features.
 	HPAController poautosclerconfig.HPAControllerConfiguration
+	// ImperativeEvictionResponderControllerConfiguration contains elements configuring
+	// the imperative eviction responder controller.
+	ImperativeEvictionResponderController imperativeevictionresponder.ImperativeEvictionResponderControllerConfiguration
 	// JobControllerConfiguration holds configuration for JobController related features.
 	JobController jobconfig.JobControllerConfiguration
 	// LegacySATokenCleanerConfiguration holds configuration for LegacySATokenCleaner related features.
@@ -136,6 +141,9 @@ type KubeControllerManagerConfiguration struct {
 	// SAControllerConfiguration holds configuration for ServiceAccountController
 	// related features.
 	SAController serviceaccountconfig.SAControllerConfiguration
+	// ServiceServingSigner holds configuration for ServiceServingSigner controller
+	// related features.
+	ServiceServingSigner podcertssignerconfig.ServiceServingSignerConfiguration
 	// ServiceControllerConfiguration holds configuration for ServiceController
 	// related features.
 	ServiceController serviceconfig.ServiceControllerConfiguration
